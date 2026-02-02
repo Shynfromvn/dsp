@@ -5,6 +5,7 @@ import random
 import shutil
 import sys
 import time
+import math
 
 import numpy as np
 import torch
@@ -89,6 +90,57 @@ def update_ema_variables(model, ema_model, alpha, global_step):
         ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
 
+# ============================================================================
+# CẢI TIẾN #5: FOCAL LOSS - Xử lý class imbalance
+# ============================================================================
+# Focal Loss giảm trọng số của các mẫu dễ phân loại, tập trung vào mẫu khó
+# Công thức: FL(p) = -alpha * (1-p)^gamma * log(p)
+# - alpha: trọng số cho positive class (0.25)
+# - gamma: focusing parameter (2) - gamma càng cao, càng tập trung vào mẫu khó
+# ============================================================================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)  # probability of correct class
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+
+# ============================================================================
+# CẢI TIẾN #4: STRONG AUGMENTATION - Tăng cường dữ liệu cho unlabeled data
+# ============================================================================
+# Augmentation mạnh giúp model học robust hơn
+# Bao gồm: Gaussian noise + Random brightness + Random blur
+# ============================================================================
+def strong_augment(x):
+    """
+    Strong augmentation cho unlabeled data.
+    Args:
+        x: Input tensor (B, C, H, W)
+    Returns:
+        Augmented tensor
+    """
+    # Gaussian noise (luôn áp dụng)
+    noise = torch.clamp(torch.randn_like(x) * 0.1, -0.2, 0.2)
+    x = x + noise
+    
+    # Random brightness/contrast (50% chance)
+    if random.random() > 0.5:
+        brightness_factor = 0.8 + random.random() * 0.4  # 0.8 - 1.2
+        x = x * brightness_factor
+    
+    # Random Gaussian blur (30% chance)
+    if random.random() > 0.7:
+        x = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+    
+    return x
+
+
 def train(args, snapshot_path):
     base_lr = args.base_lr
     num_classes = args.num_classes
@@ -134,8 +186,13 @@ def train(args, snapshot_path):
 
     optimizer = optim.SGD(model.parameters(), lr=base_lr,
                           momentum=0.9, weight_decay=0.0001)
+    
+    # ========================================================================
+    # CẢI TIẾN #5: Khởi tạo các loss functions
+    # ========================================================================
     ce_loss = CrossEntropyLoss()
     dice_loss = losses.DiceLoss(num_classes)
+    focal_loss = FocalLoss(alpha=0.25, gamma=2)  # Thêm Focal Loss
 
     writer = SummaryWriter(snapshot_path + '/log')
     logging.info("{} iterations per epoch".format(len(trainloader)))
@@ -144,6 +201,7 @@ def train(args, snapshot_path):
     max_epoch = max_iterations // len(trainloader) + 1
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
+    
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
 
@@ -151,33 +209,98 @@ def train(args, snapshot_path):
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
             unlabeled_volume_batch = volume_batch[args.labeled_bs:]
 
-            noise = torch.clamp(torch.randn_like(
-                unlabeled_volume_batch) * 0.1, -0.2, 0.2)
-            ema_inputs = unlabeled_volume_batch + noise
+            # ================================================================
+            # CẢI TIẾN #4: Sử dụng Strong Augmentation thay vì chỉ noise
+            # ================================================================
+            ema_inputs = strong_augment(unlabeled_volume_batch)
 
             outputs = model(volume_batch)
             outputs_soft = torch.softmax(outputs, dim=1)
+            
             with torch.no_grad():
                 ema_output = ema_model(ema_inputs)
                 ema_output_soft = torch.softmax(ema_output, dim=1)
 
+            # ================================================================
+            # CẢI TIẾN #5: Kết hợp CE + Dice + Focal Loss
+            # ================================================================
+            # Supervised loss trên labeled data
             loss_ce = ce_loss(outputs[:args.labeled_bs],
                               label_batch[:][:args.labeled_bs].long())
             loss_dice = dice_loss(
                 outputs_soft[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1))
-            supervised_loss = 0.5 * (loss_dice + loss_ce)
-            consistency_weight = get_current_consistency_weight(iter_num//150)
+            loss_focal = focal_loss(outputs[:args.labeled_bs],
+                                    label_batch[:][:args.labeled_bs].long())
+            
+            # Kết hợp: 40% Dice + 30% CE + 30% Focal
+            supervised_loss = 0.4 * loss_dice + 0.3 * loss_ce + 0.3 * loss_focal
+
+            # ================================================================
+            # CẢI TIẾN #1: UNCERTAINTY ESTIMATION (Quan trọng nhất!)
+            # ================================================================
+            # Sử dụng Monte Carlo sampling để ước lượng uncertainty
+            # Chỉ enforce consistency trên vùng có độ tin cậy cao (uncertainty thấp)
+            # ================================================================
+            consistency_weight = get_current_consistency_weight(iter_num // 150)
+            
             if iter_num < 1000:
                 consistency_loss = 0.0
             else:
-                consistency_loss = torch.mean(
-                    (outputs_soft[args.labeled_bs:]-ema_output_soft)**2)
+                # Monte Carlo sampling để ước lượng uncertainty
+                T = 8  # Số lần sampling
+                _, _, w, h = unlabeled_volume_batch.shape
+                volume_batch_r = unlabeled_volume_batch.repeat(2, 1, 1, 1)
+                stride = volume_batch_r.shape[0] // 2
+                preds = torch.zeros([stride * T, num_classes, w, h]).cuda()
+                
+                # Chạy T/2 lần với noise khác nhau để có T predictions
+                for i in range(T // 2):
+                    ema_inputs_mc = volume_batch_r + \
+                        torch.clamp(torch.randn_like(volume_batch_r) * 0.1, -0.2, 0.2)
+                    with torch.no_grad():
+                        preds[2 * stride * i:2 * stride * (i + 1)] = ema_model(ema_inputs_mc)
+                
+                preds = F.softmax(preds, dim=1)
+                preds = preds.reshape(T, stride, num_classes, w, h)
+                preds = torch.mean(preds, dim=0)  # Trung bình T predictions
+                
+                # Tính uncertainty bằng entropy
+                # Entropy cao = uncertainty cao = không tin tưởng
+                uncertainty = -1.0 * torch.sum(preds * torch.log(preds + 1e-6), dim=1, keepdim=True)
+                
+                # Adaptive threshold: tăng dần theo thời gian
+                # Ban đầu: threshold cao (filter nhiều vùng không chắc chắn)
+                # Về sau: threshold thấp (sử dụng nhiều vùng hơn)
+                threshold = (0.75 + 0.25 * ramps.sigmoid_rampup(iter_num, max_iterations)) * np.log(2)
+                mask = (uncertainty < threshold).float()
+                
+                # Consistency loss chỉ tính trên vùng có độ tin cậy cao
+                consistency_dist = (outputs_soft[args.labeled_bs:] - ema_output_soft) ** 2
+                consistency_loss = torch.sum(mask * consistency_dist) / (2 * torch.sum(mask) + 1e-16)
+
             loss = supervised_loss + consistency_weight * consistency_loss
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             update_ema_variables(model, ema_model, args.ema_decay, iter_num)
-            lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+
+            # ================================================================
+            # CẢI TIẾN #2: COSINE ANNEALING LEARNING RATE
+            # ================================================================
+            # Cosine annealing thường cho kết quả tốt hơn polynomial decay
+            # LR giảm mượt theo hàm cosine từ base_lr xuống 0
+            # ================================================================
+            
+            # Warm-up trong 1000 iterations đầu tiên
+            warmup_iters = 1000
+            if iter_num < warmup_iters:
+                # Linear warm-up: LR tăng dần từ 0 lên base_lr
+                lr_ = base_lr * iter_num / warmup_iters
+            else:
+                # Cosine annealing: LR giảm dần theo hàm cosine
+                lr_ = base_lr * 0.5 * (1 + math.cos(math.pi * (iter_num - warmup_iters) / (max_iterations - warmup_iters)))
+            
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_
 
@@ -186,14 +309,15 @@ def train(args, snapshot_path):
             writer.add_scalar('info/total_loss', loss, iter_num)
             writer.add_scalar('info/loss_ce', loss_ce, iter_num)
             writer.add_scalar('info/loss_dice', loss_dice, iter_num)
+            writer.add_scalar('info/loss_focal', loss_focal, iter_num)  # Thêm log focal loss
             writer.add_scalar('info/consistency_loss',
                               consistency_loss, iter_num)
             writer.add_scalar('info/consistency_weight',
                               consistency_weight, iter_num)
 
             logging.info(
-                'iteration %d : loss : %f, loss_ce: %f, loss_dice: %f' %
-                (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
+                'iteration %d : loss : %f, loss_ce: %f, loss_dice: %f, loss_focal: %f' %
+                (iter_num, loss.item(), loss_ce.item(), loss_dice.item(), loss_focal.item()))
 
             if iter_num % 20 == 0:
                 image = volume_batch[1, 0:1, :, :]
