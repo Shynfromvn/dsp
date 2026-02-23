@@ -128,11 +128,15 @@ class BoundaryLoss(nn.Module):
         # One-hot encode
         labels_one_hot = F.one_hot(labels.long(), self.n_classes).permute(0, 3, 1, 2).float()
         
+        # FIX: Đảm bảo Sobel kernels ở cùng device với input
+        sobel_x = self.sobel_x.to(labels.device)
+        sobel_y = self.sobel_y.to(labels.device)
+        
         boundary_masks = []
         for c in range(self.n_classes):
             class_mask = labels_one_hot[:, c:c+1, :, :]
-            edge_x = F.conv2d(class_mask, self.sobel_x, padding=1)
-            edge_y = F.conv2d(class_mask, self.sobel_y, padding=1)
+            edge_x = F.conv2d(class_mask, sobel_x, padding=1)
+            edge_y = F.conv2d(class_mask, sobel_y, padding=1)
             edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
             boundary_masks.append(edge)
         
