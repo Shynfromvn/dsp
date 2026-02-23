@@ -351,19 +351,6 @@ def Inference(FLAGS):
 
 if __name__ == '__main__':
     FLAGS = parser.parse_args()
-    metric_result = Inference(FLAGS)
-    
-    print("\n" + "="*50)
-    print("Results for experiment: {}".format(FLAGS.exp))
-    print("="*50)
-    print("Class 1 (RV)  - Dice: {:.4f}, HD95: {:.2f}, ASD: {:.2f}".format(
-        metric_result[0][0], metric_result[0][1], metric_result[0][2]))
-    print("Class 2 (MYO) - Dice: {:.4f}, HD95: {:.2f}, ASD: {:.2f}".format(
-        metric_result[1][0], metric_result[1][1], metric_result[1][2]))
-    print("Class 3 (LV)  - Dice: {:.4f}, HD95: {:.2f}, ASD: {:.2f}".format(
-        metric_result[2][0], metric_result[2][1], metric_result[2][2]))
-    print("-"*50)
-    avg = (metric_result[0] + metric_result[1] + metric_result[2]) / 3
-    print("Average       - Dice: {:.4f}, HD95: {:.2f}, ASD: {:.2f}".format(
-        avg[0], avg[1], avg[2]))
-    print("="*50)
+    metric = Inference(FLAGS)
+    print(metric)
+    print((metric[0]+metric[1]+metric[2])/3)
