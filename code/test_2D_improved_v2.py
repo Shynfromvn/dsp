@@ -65,20 +65,29 @@ class SqueezeExcitation(nn.Module):
 
 
 class AttentionGate(nn.Module):
-    """Attention Gate cho skip connections"""
+    """Attention Gate cho skip connections (GroupNorm thay BN cho EMA stability)"""
+    @staticmethod
+    def _get_num_groups(channels):
+        if channels == 1:
+            return 1
+        num_groups = min(32, channels)
+        while channels % num_groups != 0:
+            num_groups -= 1
+        return num_groups
+    
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(F_g, F_int, 1, bias=True),
-            nn.BatchNorm2d(F_int)
+            nn.GroupNorm(self._get_num_groups(F_int), F_int)
         )
         self.W_x = nn.Sequential(
             nn.Conv2d(F_l, F_int, 1, bias=True),
-            nn.BatchNorm2d(F_int)
+            nn.GroupNorm(self._get_num_groups(F_int), F_int)
         )
         self.psi = nn.Sequential(
             nn.Conv2d(F_int, 1, 1, bias=True),
-            nn.BatchNorm2d(1),
+            nn.GroupNorm(1, 1),
             nn.Sigmoid()
         )
         self.relu = nn.ReLU(inplace=True)
@@ -92,28 +101,36 @@ class AttentionGate(nn.Module):
 
 class ASPP(nn.Module):
     """Atrous Spatial Pyramid Pooling"""
+    @staticmethod
+    def _gn_groups(channels):
+        num_groups = min(32, channels)
+        while channels % num_groups != 0:
+            num_groups -= 1
+        return num_groups
+    
     def __init__(self, in_channels, out_channels):
         super().__init__()
+        gn = self._gn_groups(out_channels)
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True)
         )
         self.conv6 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True)
         )
         self.conv12 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True)
         )
         self.pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True)
         )
         self.fuse = nn.Sequential(
             nn.Conv2d(out_channels * 4, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True),
             nn.Dropout(0.3)
         )
     

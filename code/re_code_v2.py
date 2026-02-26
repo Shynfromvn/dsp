@@ -418,21 +418,35 @@ class AttentionGate(nn.Module):
     2. Encoder feature (x) → 1x1 conv → hiểu "encoder có gì"
     3. Cộng 2 signals → ReLU → 1x1 conv → Sigmoid → attention map
     4. attention_map × encoder_features → features đã filtered
+    
+    FIX: Dùng GroupNorm thay BatchNorm2d để EMA teacher model hoạt động đúng.
+    BatchNorm buffers (running_mean/var) KHÔNG được EMA sync → output sai.
+    GroupNorm không cần running stats → ổn định trong cả train/eval mode.
     """
+    @staticmethod
+    def _get_num_groups(channels):
+        """Tính num_groups phù hợp cho GroupNorm"""
+        if channels == 1:
+            return 1
+        num_groups = min(32, channels)
+        while channels % num_groups != 0:
+            num_groups -= 1
+        return num_groups
+    
     def __init__(self, F_g, F_l, F_int):
         """F_g: decoder channels, F_l: encoder channels, F_int: intermediate"""
         super().__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(F_g, F_int, 1, bias=True),
-            nn.BatchNorm2d(F_int)
+            nn.GroupNorm(self._get_num_groups(F_int), F_int)
         )
         self.W_x = nn.Sequential(
             nn.Conv2d(F_l, F_int, 1, bias=True),
-            nn.BatchNorm2d(F_int)
+            nn.GroupNorm(self._get_num_groups(F_int), F_int)
         )
         self.psi = nn.Sequential(
             nn.Conv2d(F_int, 1, 1, bias=True),
-            nn.BatchNorm2d(1),
+            nn.GroupNorm(1, 1),
             nn.Sigmoid()
         )
         self.relu = nn.ReLU(inplace=True)
@@ -458,28 +472,36 @@ class ASPP(nn.Module):
     - Global Average Pooling capture toàn bộ context
     → Kết hợp cho model "nhìn" ở nhiều kích thước đồng thời
     """
+    @staticmethod
+    def _gn_groups(channels):
+        num_groups = min(32, channels)
+        while channels % num_groups != 0:
+            num_groups -= 1
+        return num_groups
+    
     def __init__(self, in_channels, out_channels):
         super().__init__()
+        gn = self._gn_groups(out_channels)
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True)
         )
         self.conv6 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True)
         )
         self.conv12 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True)
         )
         self.pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True)
         )
         self.fuse = nn.Sequential(
             nn.Conv2d(out_channels * 4, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
+            nn.GroupNorm(gn, out_channels), nn.ReLU(inplace=True),
             nn.Dropout(0.3)  # Giảm từ 0.5 V1
         )
     
@@ -942,7 +964,10 @@ def train(args, snapshot_path):
                 )
 
             # === Mixed Consistency (MSE + KL) ===
-            consistency_weight = get_current_consistency_weight(iter_num // 150)
+            # Scale consistency rampup with max_iterations (not hardcoded 150)
+            consistency_weight = get_current_consistency_weight(
+                iter_num // max(max_iterations // 200, 1)
+            )
             
             # MSE component
             consistency_dist_mse = losses.softmax_mse_loss(
