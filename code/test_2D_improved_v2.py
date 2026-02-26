@@ -1,12 +1,13 @@
 """
-test_2D_improved_v2.py - Test script cho ImprovedUNetV2 tu re_code_v2.py
+test_2D_improved_v2.py - Test script cho ImprovedUNetV3 tu re_code_v2.py
 
-Su dung: python test_2D_improved_v2.py --root_path ../data/ACDC --exp ACDC/UAMT_V2_1 --num_classes 4 --labeled_num 7
+Su dung: python test_2D_improved_v2.py --root_path ../data/ACDC --exp ACDC/UAMT_V3_1 --num_classes 4 --labeled_num 7
 
-Cai tien so voi test_2D_improved.py (V1):
-1. Test-Time Augmentation (TTA): Flip + Rotate de tang do chinh xac
-2. Model architecture V2 (SE + AttentionGate + ASPP + GroupNorm)
-3. Tinh them metric ASD (Average Surface Distance)
+Model architecture khop voi re_code_v2.py:
+- ImprovedUNetV3 voi EncoderV3 + DecoderV3
+- SE blocks, Attention Gates, ASPP, GroupNorm
+- Wider channels [32, 64, 128, 256, 512]
+- TTA (Test-Time Augmentation) de tang accuracy
 """
 import argparse
 import os
@@ -28,7 +29,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
                     default='../data/ACDC', help='Name of Experiment')
 parser.add_argument('--exp', type=str,
-                    default='ACDC/UAMT_V2', help='experiment_name')
+                    default='ACDC/UAMT_V3', help='experiment_name')
 parser.add_argument('--model', type=str,
                     default='unet', help='model_name')
 parser.add_argument('--num_classes', type=int, default=4,
@@ -40,19 +41,19 @@ parser.add_argument('--use_tta', type=int, default=1,
 
 
 # =====================================================================
-#          MODEL ARCHITECTURE V2 (copy tu re_code_v2.py)
+#     MODEL ARCHITECTURE V3 (copy CHINH XAC tu re_code_v2.py)
 # =====================================================================
 
 class SqueezeExcitation(nn.Module):
     """SE Block: Channel recalibration"""
     def __init__(self, channels, reduction=16):
-        super(SqueezeExcitation, self).__init__()
-        mid_channels = max(channels // reduction, 8)
+        super().__init__()
+        mid = max(channels // reduction, 8)
         self.squeeze = nn.AdaptiveAvgPool2d(1)
         self.excitation = nn.Sequential(
-            nn.Linear(channels, mid_channels, bias=False),
+            nn.Linear(channels, mid, bias=False),
             nn.ReLU(inplace=True),
-            nn.Linear(mid_channels, channels, bias=False),
+            nn.Linear(mid, channels, bias=False),
             nn.Sigmoid()
         )
     
@@ -66,17 +67,17 @@ class SqueezeExcitation(nn.Module):
 class AttentionGate(nn.Module):
     """Attention Gate cho skip connections"""
     def __init__(self, F_g, F_l, F_int):
-        super(AttentionGate, self).__init__()
+        super().__init__()
         self.W_g = nn.Sequential(
-            nn.Conv2d(F_g, F_int, kernel_size=1, bias=True),
+            nn.Conv2d(F_g, F_int, 1, bias=True),
             nn.BatchNorm2d(F_int)
         )
         self.W_x = nn.Sequential(
-            nn.Conv2d(F_l, F_int, kernel_size=1, bias=True),
+            nn.Conv2d(F_l, F_int, 1, bias=True),
             nn.BatchNorm2d(F_int)
         )
         self.psi = nn.Sequential(
-            nn.Conv2d(F_int, 1, kernel_size=1, bias=True),
+            nn.Conv2d(F_int, 1, 1, bias=True),
             nn.BatchNorm2d(1),
             nn.Sigmoid()
         )
@@ -84,9 +85,7 @@ class AttentionGate(nn.Module):
     
     def forward(self, g, x):
         g_up = F.interpolate(g, size=x.shape[2:], mode='bilinear', align_corners=True)
-        g1 = self.W_g(g_up)
-        x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
+        psi = self.relu(self.W_g(g_up) + self.W_x(x))
         psi = self.psi(psi)
         return x * psi
 
@@ -94,74 +93,64 @@ class AttentionGate(nn.Module):
 class ASPP(nn.Module):
     """Atrous Spatial Pyramid Pooling"""
     def __init__(self, in_channels, out_channels):
-        super(ASPP, self).__init__()
+        super().__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
         )
         self.conv6 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
         )
         self.conv12 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
         )
         self.pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
         )
         self.fuse = nn.Sequential(
             nn.Conv2d(out_channels * 4, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5)
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
+            nn.Dropout(0.3)
         )
     
     def forward(self, x):
         size = x.shape[2:]
-        feat1 = self.conv1(x)
-        feat6 = self.conv6(x)
-        feat12 = self.conv12(x)
-        feat_pool = F.interpolate(self.pool(x), size=size, mode='bilinear', align_corners=True)
-        out = torch.cat([feat1, feat6, feat12, feat_pool], dim=1)
+        out = torch.cat([
+            self.conv1(x), self.conv6(x), self.conv12(x),
+            F.interpolate(self.pool(x), size=size, mode='bilinear', align_corners=True)
+        ], dim=1)
         return self.fuse(out)
 
 
 class ResConvBlock(nn.Module):
-    """Residual Conv Block voi SE attention va GroupNorm"""
+    """Residual Conv Block voi SE + GroupNorm"""
     def __init__(self, in_channels, out_channels, dropout_p, use_se=True):
-        super(ResConvBlock, self).__init__()
+        super().__init__()
         self.use_se = use_se
-        
         num_groups = min(32, out_channels)
         while out_channels % num_groups != 0:
             num_groups -= 1
         
         self.conv_block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
             nn.GroupNorm(num_groups, out_channels),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout2d(dropout_p),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
             nn.GroupNorm(num_groups, out_channels),
         )
-        
         self.skip = nn.Identity()
         if in_channels != out_channels:
             self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.Conv2d(in_channels, out_channels, 1, bias=False),
                 nn.GroupNorm(num_groups, out_channels)
             )
-        
         if use_se:
-            self.se = SqueezeExcitation(out_channels, reduction=16)
-        
+            self.se = SqueezeExcitation(out_channels)
         self.activation = nn.LeakyReLU(0.2, inplace=True)
     
     def forward(self, x):
@@ -172,30 +161,30 @@ class ResConvBlock(nn.Module):
         return self.activation(out + residual)
 
 
-class EncoderV2(nn.Module):
-    """Encoder V2 voi wider channels va SE blocks"""
+class EncoderV3(nn.Module):
+    """Encoder voi wider channels + SE blocks"""
     def __init__(self, params):
-        super(EncoderV2, self).__init__()
-        self.in_chns = params['in_chns']
+        super().__init__()
         self.ft_chns = params['feature_chns']
         self.dropout = params['dropout']
         
-        self.in_conv = ResConvBlock(self.in_chns, self.ft_chns[0], self.dropout[0], use_se=True)
+        self.in_conv = ResConvBlock(params['in_chns'], self.ft_chns[0], 
+                                     self.dropout[0], use_se=True)
         self.down1 = nn.Sequential(
             nn.MaxPool2d(2),
-            ResConvBlock(self.ft_chns[0], self.ft_chns[1], self.dropout[1], use_se=True)
+            ResConvBlock(self.ft_chns[0], self.ft_chns[1], self.dropout[1])
         )
         self.down2 = nn.Sequential(
             nn.MaxPool2d(2),
-            ResConvBlock(self.ft_chns[1], self.ft_chns[2], self.dropout[2], use_se=True)
+            ResConvBlock(self.ft_chns[1], self.ft_chns[2], self.dropout[2])
         )
         self.down3 = nn.Sequential(
             nn.MaxPool2d(2),
-            ResConvBlock(self.ft_chns[2], self.ft_chns[3], self.dropout[3], use_se=True)
+            ResConvBlock(self.ft_chns[2], self.ft_chns[3], self.dropout[3])
         )
         self.down4 = nn.Sequential(
             nn.MaxPool2d(2),
-            ResConvBlock(self.ft_chns[3], self.ft_chns[4], self.dropout[4], use_se=True)
+            ResConvBlock(self.ft_chns[3], self.ft_chns[4], self.dropout[4])
         )
     
     def forward(self, x):
@@ -207,37 +196,37 @@ class EncoderV2(nn.Module):
         return [x0, x1, x2, x3, x4]
 
 
-class DecoderV2(nn.Module):
-    """Decoder V2 voi Attention Gates va Deep Supervision"""
+class DecoderV3(nn.Module):
+    """Decoder voi Attention Gates + ASPP + Deep Supervision"""
     def __init__(self, params):
-        super(DecoderV2, self).__init__()
-        self.ft_chns = params['feature_chns']
+        super().__init__()
+        ft = params['feature_chns']
         self.n_class = params['class_num']
         
-        self.aspp = ASPP(self.ft_chns[4], self.ft_chns[4])
+        self.aspp = ASPP(ft[4], ft[4])
         
-        self.ag3 = AttentionGate(self.ft_chns[4], self.ft_chns[3], self.ft_chns[3] // 2)
-        self.ag2 = AttentionGate(self.ft_chns[3], self.ft_chns[2], self.ft_chns[2] // 2)
-        self.ag1 = AttentionGate(self.ft_chns[2], self.ft_chns[1], self.ft_chns[1] // 2)
-        self.ag0 = AttentionGate(self.ft_chns[1], self.ft_chns[0], self.ft_chns[0] // 2)
+        self.ag3 = AttentionGate(ft[4], ft[3], ft[3] // 2)
+        self.ag2 = AttentionGate(ft[3], ft[2], ft[2] // 2)
+        self.ag1 = AttentionGate(ft[2], ft[1], ft[1] // 2)
+        self.ag0 = AttentionGate(ft[1], ft[0], ft[0] // 2)
         
-        self.up4 = nn.ConvTranspose2d(self.ft_chns[4], self.ft_chns[3], kernel_size=2, stride=2)
-        self.conv4 = ResConvBlock(self.ft_chns[3] * 2, self.ft_chns[3], 0.0, use_se=True)
+        self.up4 = nn.ConvTranspose2d(ft[4], ft[3], kernel_size=2, stride=2)
+        self.conv4 = ResConvBlock(ft[3] * 2, ft[3], 0.0, use_se=True)
         
-        self.up3 = nn.ConvTranspose2d(self.ft_chns[3], self.ft_chns[2], kernel_size=2, stride=2)
-        self.conv3 = ResConvBlock(self.ft_chns[2] * 2, self.ft_chns[2], 0.0, use_se=True)
+        self.up3 = nn.ConvTranspose2d(ft[3], ft[2], kernel_size=2, stride=2)
+        self.conv3 = ResConvBlock(ft[2] * 2, ft[2], 0.0, use_se=True)
         
-        self.up2 = nn.ConvTranspose2d(self.ft_chns[2], self.ft_chns[1], kernel_size=2, stride=2)
-        self.conv2 = ResConvBlock(self.ft_chns[1] * 2, self.ft_chns[1], 0.0, use_se=True)
+        self.up2 = nn.ConvTranspose2d(ft[2], ft[1], kernel_size=2, stride=2)
+        self.conv2 = ResConvBlock(ft[1] * 2, ft[1], 0.0, use_se=True)
         
-        self.up1 = nn.ConvTranspose2d(self.ft_chns[1], self.ft_chns[0], kernel_size=2, stride=2)
-        self.conv1 = ResConvBlock(self.ft_chns[0] * 2, self.ft_chns[0], 0.0, use_se=True)
+        self.up1 = nn.ConvTranspose2d(ft[1], ft[0], kernel_size=2, stride=2)
+        self.conv1 = ResConvBlock(ft[0] * 2, ft[0], 0.0, use_se=True)
         
-        self.out_conv = nn.Conv2d(self.ft_chns[0], self.n_class, kernel_size=1)
+        self.out_conv = nn.Conv2d(ft[0], self.n_class, kernel_size=1)
         
-        self.ds_out3 = nn.Conv2d(self.ft_chns[3], self.n_class, kernel_size=1)
-        self.ds_out2 = nn.Conv2d(self.ft_chns[2], self.n_class, kernel_size=1)
-        self.ds_out1 = nn.Conv2d(self.ft_chns[1], self.n_class, kernel_size=1)
+        self.ds_out3 = nn.Conv2d(ft[3], self.n_class, kernel_size=1)
+        self.ds_out2 = nn.Conv2d(ft[2], self.n_class, kernel_size=1)
+        self.ds_out1 = nn.Conv2d(ft[1], self.n_class, kernel_size=1)
     
     def forward(self, features, return_deep_supervision=False):
         x0, x1, x2, x3, x4 = features
@@ -246,29 +235,28 @@ class DecoderV2(nn.Module):
         x4 = self.aspp(x4)
         
         x3_att = self.ag3(g=x4, x=x3)
-        d3 = self.up4(x4)
-        d3 = torch.cat([d3, x3_att], dim=1)
+        d3 = torch.cat([self.up4(x4), x3_att], dim=1)
         d3 = self.conv4(d3)
         if return_deep_supervision:
-            ds3 = F.interpolate(self.ds_out3(d3), size=target_shape, mode='bilinear', align_corners=True)
+            ds3 = F.interpolate(self.ds_out3(d3), size=target_shape,
+                               mode='bilinear', align_corners=True)
         
         x2_att = self.ag2(g=d3, x=x2)
-        d2 = self.up3(d3)
-        d2 = torch.cat([d2, x2_att], dim=1)
+        d2 = torch.cat([self.up3(d3), x2_att], dim=1)
         d2 = self.conv3(d2)
         if return_deep_supervision:
-            ds2 = F.interpolate(self.ds_out2(d2), size=target_shape, mode='bilinear', align_corners=True)
+            ds2 = F.interpolate(self.ds_out2(d2), size=target_shape,
+                               mode='bilinear', align_corners=True)
         
         x1_att = self.ag1(g=d2, x=x1)
-        d1 = self.up2(d2)
-        d1 = torch.cat([d1, x1_att], dim=1)
+        d1 = torch.cat([self.up2(d2), x1_att], dim=1)
         d1 = self.conv2(d1)
         if return_deep_supervision:
-            ds1 = F.interpolate(self.ds_out1(d1), size=target_shape, mode='bilinear', align_corners=True)
+            ds1 = F.interpolate(self.ds_out1(d1), size=target_shape,
+                               mode='bilinear', align_corners=True)
         
         x0_att = self.ag0(g=d1, x=x0)
-        d0 = self.up1(d1)
-        d0 = torch.cat([d0, x0_att], dim=1)
+        d0 = torch.cat([self.up1(d1), x0_att], dim=1)
         d0 = self.conv1(d0)
         
         output = self.out_conv(d0)
@@ -278,17 +266,15 @@ class DecoderV2(nn.Module):
         return output
 
 
-class ImprovedUNetV2(nn.Module):
+class ImprovedUNetV3(nn.Module):
     """
-    Improved UNet V2 voi:
-    - SE blocks (channel recalibration)
-    - Attention Gates (skip connection filtering)
-    - ASPP (multi-scale context)
-    - GroupNorm (small batch friendly)
-    - Wider channels [32,64,128,256,512]
+    ImprovedUNetV3 - khop voi re_code_v2.py
+    - SE blocks, Attention Gates, ASPP, GroupNorm
+    - Channels [32, 64, 128, 256, 512]
+    - Dropout [0.05, 0.1, 0.15, 0.2, 0.3]
     """
     def __init__(self, in_chns, class_num, deep_supervision=True):
-        super(ImprovedUNetV2, self).__init__()
+        super().__init__()
         self.deep_supervision = deep_supervision
         
         params = {
@@ -298,8 +284,8 @@ class ImprovedUNetV2(nn.Module):
             'class_num': class_num,
         }
         
-        self.encoder = EncoderV2(params)
-        self.decoder = DecoderV2(params)
+        self.encoder = EncoderV3(params)
+        self.decoder = DecoderV3(params)
         self._init_weights()
     
     def _init_weights(self):
@@ -315,11 +301,8 @@ class ImprovedUNetV2(nn.Module):
     def forward(self, x):
         features = self.encoder(x)
         if self.training and self.deep_supervision:
-            output, ds1, ds2, ds3 = self.decoder(features, return_deep_supervision=True)
-            return output, ds1, ds2, ds3
-        else:
-            output = self.decoder(features, return_deep_supervision=False)
-            return output
+            return self.decoder(features, return_deep_supervision=True)
+        return self.decoder(features, return_deep_supervision=False)
 
 
 # =====================================================================
@@ -340,21 +323,7 @@ def calculate_metric_percase(pred, gt):
 
 def test_single_volume_tta(case, net, test_save_path, FLAGS):
     """
-    Test-Time Augmentation (TTA)
-    
-    Y tuong: Tai thoi diem test, thuc hien nhieu phep bien doi 
-    (flip, rotate) tren input, predict tung cai, roi average ket qua.
-    
-    TTA giup:
-    - Giam variance cua predictions
-    - Tang robustness voi orientations khac nhau
-    - Thuong tang 0.5-2% Dice score mien phi (khong can re-train)
-    
-    Augmentations su dung:
-    1. Original
-    2. Horizontal flip
-    3. Vertical flip
-    4. Horizontal + Vertical flip
+    Test-Time Augmentation (TTA): flip augmentations de tang accuracy
     """
     h5f = h5py.File(FLAGS.root_path + "/data/{}.h5".format(case), 'r')
     image = h5f['image'][:]
@@ -370,7 +339,6 @@ def test_single_volume_tta(case, net, test_save_path, FLAGS):
         net.eval()
         with torch.no_grad():
             if FLAGS.use_tta:
-                # === TTA: 4 augmentations ===
                 probs_list = []
                 
                 # 1. Original
@@ -400,11 +368,9 @@ def test_single_volume_tta(case, net, test_save_path, FLAGS):
                     out_hv = out_hv[0]
                 probs_list.append(torch.flip(torch.softmax(out_hv, dim=1), [2, 3]))
                 
-                # Average all predictions
                 avg_probs = torch.mean(torch.stack(probs_list), dim=0)
                 out = torch.argmax(avg_probs, dim=1).squeeze(0)
             else:
-                # No TTA
                 out_main = net(input_tensor)
                 if isinstance(out_main, tuple):
                     out_main = out_main[0]
@@ -445,8 +411,8 @@ def Inference(FLAGS):
         shutil.rmtree(test_save_path)
     os.makedirs(test_save_path)
     
-    # Su dung ImprovedUNetV2
-    net = ImprovedUNetV2(in_chns=1, class_num=FLAGS.num_classes, deep_supervision=False)
+    # Su dung ImprovedUNetV3 (khop voi re_code_v2.py)
+    net = ImprovedUNetV3(in_chns=1, class_num=FLAGS.num_classes, deep_supervision=False)
     net = net.cuda()
     
     save_mode_path = os.path.join(snapshot_path, '{}_best_model.pth'.format(FLAGS.model))
