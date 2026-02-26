@@ -157,13 +157,15 @@ class ExponentialLogarithmicLoss(nn.Module):
         """
         # Dice component: -ln(Dice_c) rồi power gamma, rồi trung bình
         dice_scores = self._dice_per_class(outputs_soft, labels)
-        dice_log = torch.stack([-torch.log(d + 1e-7) for d in dice_scores])
-        loss_dice = torch.mean(dice_log ** self.gamma)
+        # FIX 1: Clamp dice to avoid extreme log values for missing classes
+        dice_log = torch.stack([-torch.log(torch.clamp(d, min=1e-4)) for d in dice_scores])
+        loss_dice = torch.mean(torch.clamp(dice_log ** self.gamma, max=10.0))
         
         # CE component: (-ln(p_t))^gamma cho mỗi pixel
         labels_long = labels.long()
         pt = outputs_soft.gather(1, labels_long.unsqueeze(1)).squeeze(1)  # p(đúng class)
-        loss_ce = torch.mean((-torch.log(pt + 1e-7)) ** self.gamma)
+        pt = torch.clamp(pt, min=1e-7)  # FIX 1: prevent log(0)
+        loss_ce = torch.mean((-torch.log(pt)) ** self.gamma)
         
         return self.w_dice * loss_dice + self.w_ce * loss_ce
 
@@ -212,6 +214,7 @@ class ClassAdaptiveDiceLoss(nn.Module):
             # Ví dụ: background 70% → weight ≈ 1.2, RV 5% → weight ≈ 4.5
             class_freq = target_c.sum() / (target_c.numel() + self.smooth)
             weight = 1.0 / (torch.sqrt(class_freq) + self.smooth)
+            weight = torch.clamp(weight, max=20.0)  # FIX 2: prevent weight explosion for missing classes
             
             total_loss += weight * (1.0 - dice)
             total_weight += weight
@@ -755,9 +758,12 @@ def get_cosine_lr(base_lr, iter_num, max_iterations, warmup_iters=1000):
     - Warmup: tránh gradient lớn ở đầu khi attention modules random
     - Cosine: smooth hơn polynomial, proven tốt hơn trong literature
     """
+    # FIX 4: auto-cap warmup to ~22.5% of max_iterations (range 20-25%)
+    warmup_iters = min(warmup_iters, int(max_iterations * 0.225))
+    warmup_iters = max(warmup_iters, 1)  # avoid division by zero
     if iter_num < warmup_iters:
         return base_lr * iter_num / warmup_iters
-    progress = (iter_num - warmup_iters) / (max_iterations - warmup_iters)
+    progress = (iter_num - warmup_iters) / max(max_iterations - warmup_iters, 1)
     return base_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
 
 
@@ -908,8 +914,8 @@ def train(args, snapshot_path):
             )
             # KL component (tốt hơn MSE cho probability distributions)
             student_log_soft = F.log_softmax(outputs[args.labeled_bs:], dim=1)
-            teacher_soft = F.softmax(ema_output, dim=1)
-            consistency_dist_kl = F.kl_div(student_log_soft, teacher_soft, reduction='none')
+            teacher_log_soft = F.log_softmax(ema_output, dim=1)  # FIX 3: use log-space to avoid NaN
+            consistency_dist_kl = F.kl_div(student_log_soft, teacher_log_soft, reduction='none', log_target=True)  # FIX 3: avoids 0*log(0)=NaN
             
             kl_w = args.kl_consistency_weight
             consistency_dist = (1 - kl_w) * consistency_dist_mse + kl_w * consistency_dist_kl
@@ -921,6 +927,13 @@ def train(args, snapshot_path):
 
             # Total loss
             loss = supervised_loss + consistency_weight * consistency_loss
+
+            # FIX 5: NaN safety - skip update if loss is NaN/Inf
+            if not torch.isfinite(loss):
+                logging.warning(f'Skipping iteration {iter_num} due to NaN/Inf loss')
+                optimizer.zero_grad()
+                iter_num += 1
+                continue
 
             optimizer.zero_grad()
             loss.backward()
