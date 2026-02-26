@@ -851,6 +851,16 @@ def train(args, snapshot_path):
                 outputs = model_output
                 ds1 = ds2 = ds3 = None
             
+            # SAFETY: clean model outputs
+            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                if iter_num <= 5:
+                    logging.warning(f'[DEBUG] NaN/Inf in student outputs at iter {iter_num}')
+                outputs = torch.nan_to_num(outputs, nan=0.0, posinf=1e4, neginf=-1e4)
+                if ds1 is not None:
+                    ds1 = torch.nan_to_num(ds1, nan=0.0, posinf=1e4, neginf=-1e4)
+                    ds2 = torch.nan_to_num(ds2, nan=0.0, posinf=1e4, neginf=-1e4)
+                    ds3 = torch.nan_to_num(ds3, nan=0.0, posinf=1e4, neginf=-1e4)
+            
             outputs_soft = torch.softmax(outputs, dim=1)
 
             # Teacher forward (with noise)
@@ -861,6 +871,7 @@ def train(args, snapshot_path):
                 ema_output = ema_model(ema_inputs)
                 if isinstance(ema_output, tuple):
                     ema_output = ema_output[0]
+                ema_output = torch.nan_to_num(ema_output, nan=0.0, posinf=1e4, neginf=-1e4)
 
             # MC Dropout uncertainty estimation
             T = 8
@@ -878,6 +889,7 @@ def train(args, snapshot_path):
                     pred = ema_model(ema_inputs_mc)
                     if isinstance(pred, tuple):
                         pred = pred[0]
+                    pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
                     preds[2 * stride * i:2 * stride * (i + 1)] = pred
             ema_model.eval()
             
@@ -886,24 +898,48 @@ def train(args, snapshot_path):
             preds = torch.mean(preds, dim=0)
             uncertainty = -1.0 * torch.sum(preds * torch.log(preds + 1e-6), dim=1, keepdim=True)
 
-            # === Supervised Loss V3 ===
-            supervised_loss, loss_ce, loss_region = combined_loss(
-                outputs[:args.labeled_bs],
-                outputs_soft[:args.labeled_bs],
-                label_batch[:args.labeled_bs],
-                iter_num, max_iterations
-            )
+            # === Supervised Loss V3 with burn-in strategy ===
+            burn_in_iters = int(max_iterations * 0.1)  # first 10% use simple loss
             
-            # Deep supervision với weight GIẢM DẦN (V1 cố định 0.4)
+            if iter_num < burn_in_iters:
+                # BURN-IN: use simple CE + Dice (proven to work, no NaN)
+                loss_ce_simple = F.cross_entropy(
+                    outputs[:args.labeled_bs], 
+                    label_batch[:args.labeled_bs].long()
+                )
+                loss_dice_simple = dice_loss(
+                    outputs_soft[:args.labeled_bs], 
+                    label_batch[:args.labeled_bs].unsqueeze(1)
+                )
+                supervised_loss = 0.5 * loss_ce_simple + 0.5 * loss_dice_simple
+                loss_ce = loss_ce_simple.detach()
+                loss_region = loss_dice_simple.detach()
+            else:
+                # After burn-in: use custom V3 losses
+                supervised_loss, loss_ce, loss_region = combined_loss(
+                    outputs[:args.labeled_bs],
+                    outputs_soft[:args.labeled_bs],
+                    label_batch[:args.labeled_bs],
+                    iter_num, max_iterations
+                )
+            
+            # Deep supervision
             if ds1 is not None:
                 ds_loss = 0.0
                 for ds_out in [ds1, ds2, ds3]:
                     ds_soft = torch.softmax(ds_out[:args.labeled_bs], dim=1)
                     ds_loss += dice_loss(ds_soft, label_batch[:args.labeled_bs].unsqueeze(1))
                 ds_loss /= 3.0
-                # Giảm từ 0.4 → 0.05 theo training progress
                 ds_weight = 0.4 * (1.0 - min(iter_num / max_iterations, 0.8))
                 supervised_loss = supervised_loss + ds_weight * ds_loss
+            
+            # NaN safety on supervised_loss
+            if not torch.isfinite(supervised_loss):
+                logging.warning(f'[DEBUG] NaN in supervised_loss at iter {iter_num}, fallback to CE')
+                supervised_loss = F.cross_entropy(
+                    outputs[:args.labeled_bs], 
+                    label_batch[:args.labeled_bs].long()
+                )
 
             # === Mixed Consistency (MSE + KL) ===
             consistency_weight = get_current_consistency_weight(iter_num // 150)
@@ -912,10 +948,10 @@ def train(args, snapshot_path):
             consistency_dist_mse = losses.softmax_mse_loss(
                 outputs[args.labeled_bs:], ema_output
             )
-            # KL component (tốt hơn MSE cho probability distributions)
+            # KL component
             student_log_soft = F.log_softmax(outputs[args.labeled_bs:], dim=1)
-            teacher_log_soft = F.log_softmax(ema_output, dim=1)  # FIX 3: use log-space to avoid NaN
-            consistency_dist_kl = F.kl_div(student_log_soft, teacher_log_soft, reduction='none', log_target=True)  # FIX 3: avoids 0*log(0)=NaN
+            teacher_log_soft = F.log_softmax(ema_output, dim=1)
+            consistency_dist_kl = F.kl_div(student_log_soft, teacher_log_soft, reduction='none', log_target=True)
             
             kl_w = args.kl_consistency_weight
             consistency_dist = (1 - kl_w) * consistency_dist_mse + kl_w * consistency_dist_kl
@@ -924,11 +960,26 @@ def train(args, snapshot_path):
             threshold = (0.75 + 0.25 * ramps.sigmoid_rampup(iter_num, max_iterations)) * np.log(2)
             mask = (uncertainty < threshold).float()
             consistency_loss = torch.sum(mask * consistency_dist) / (2 * torch.sum(mask) + 1e-16)
+            
+            # NaN safety on consistency_loss
+            if not torch.isfinite(consistency_loss):
+                if iter_num <= 5:
+                    logging.warning(f'[DEBUG] NaN in consistency_loss at iter {iter_num}')
+                consistency_loss = torch.tensor(0.0, device=volume_batch.device, requires_grad=False)
 
             # Total loss
             loss = supervised_loss + consistency_weight * consistency_loss
 
-            # FIX 5: NaN safety - skip update if loss is NaN/Inf
+            # NaN debug logging for first few iterations
+            if iter_num <= 5:
+                logging.info(
+                    f'[DEBUG] iter {iter_num}: loss={loss.item():.6f}, '
+                    f'sup={supervised_loss.item():.6f}, cons={consistency_loss.item():.6f}, '
+                    f'model_nan={torch.isnan(outputs).any().item()}, '
+                    f'ema_nan={torch.isnan(ema_output).any().item()}'
+                )
+
+            # Final NaN safety - skip if still NaN
             if not torch.isfinite(loss):
                 logging.warning(f'Skipping iteration {iter_num} due to NaN/Inf loss')
                 optimizer.zero_grad()
